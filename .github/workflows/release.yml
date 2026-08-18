@@ -1,0 +1,164 @@
+# This workflow bumps the gem version and tags a release when a pull request is
+# merged into main. The semantic version level comes from the pull request's
+# labels:
+#
+#   release:major  a breaking change
+#   release:minor  a backwards compatible feature
+#   no label       a patch, the default
+#   no-release     opt out, no version bump and no tag
+#
+# Pull requests confined to documentation, tests and CI never release, whatever
+# their labels, via the `paths-ignore` filter below.
+#
+# `release:major` wins when both release labels are present. Any other
+# `release:`-prefixed label fails the run rather than silently bumping a patch,
+# so a typo cannot ship a breaking change as a patch release.
+#
+# Prerequisite: if `main` is protected, `GITHUB_TOKEN` cannot push to it. Either
+# grant the GitHub Actions app a ruleset bypass, or replace the `token` input on
+# the checkout step with a GitHub App installation token or PAT that can.
+name: "Release"
+
+on:
+  pull_request:
+    branches:
+      - "main"
+    types: ["closed"]
+    # Skipped only when every changed file matches. A pull request touching both
+    # documentation and shipped code still releases.
+    paths-ignore:
+      - "docs/**"
+      - "test/**"
+      - ".github/**"
+      - "**.md"
+
+# Serialise runs so back-to-back merges cannot compute the same version.
+concurrency:
+  group: "${{ github.workflow }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: "read"
+
+env:
+  VERSION_FILE: "lib/charting/dashboard/version.rb"
+
+jobs:
+  release:
+    name: "Bump Version"
+    runs-on: "ubuntu-latest"
+    timeout-minutes: 10
+    # Fork pull requests get a read-only token, so they could never push.
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !contains(github.event.pull_request.labels.*.name, 'no-release')
+    permissions:
+      contents: "write"
+    steps:
+      - name: "Checkout Main"
+        uses: "actions/checkout@v5"
+        with:
+          ref: "main"
+          fetch-depth: 0
+          token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: "Resolve Next Version"
+        id: "version"
+        env:
+          PULL_REQUEST_LABELS: "${{ toJSON(github.event.pull_request.labels.*.name) }}"
+        run: |
+          set -euo pipefail
+
+          labels="$(jq -r '.[] | ascii_downcase | select(startswith("release:"))' <<< "${PULL_REQUEST_LABELS}")"
+
+          while read -r label; do
+            [ -n "${label}" ] || continue
+
+            case "${label}" in
+              release:major | release:minor) ;;
+              *)
+                echo "::error::Unrecognised label '${label}'. Use release:major or release:minor."
+                exit 1
+                ;;
+            esac
+          done <<< "${labels}"
+
+          if grep -qx "release:major" <<< "${labels}"; then
+            level="major"
+          elif grep -qx "release:minor" <<< "${labels}"; then
+            level="minor"
+          else
+            level="patch"
+          fi
+
+          current="$(sed -n "s/^ *VERSION = '\(.*\)'.*/\1/p" "${VERSION_FILE}")"
+
+          if ! echo "${current}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Could not read a semantic version from ${VERSION_FILE}."
+            exit 1
+          fi
+
+          IFS='.' read -r major minor patch <<< "${current}"
+
+          case "${level}" in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+          esac
+
+          next="${major}.${minor}.${patch}"
+
+          if git rev-parse --verify --quiet "refs/tags/v${next}" > /dev/null; then
+            echo "::error::Tag v${next} already exists."
+            exit 1
+          fi
+
+          echo "level=${level}" >> "${GITHUB_OUTPUT}"
+          echo "next=${next}" >> "${GITHUB_OUTPUT}"
+          echo "::notice::${level} bump: ${current} to ${next}."
+
+      - name: "Write Version File"
+        env:
+          NEXT_VERSION: "${{ steps.version.outputs.next }}"
+        run: |
+          set -euo pipefail
+
+          sed -i -E "s/VERSION = '[^']*'/VERSION = '${NEXT_VERSION}'/" "${VERSION_FILE}"
+
+          if git diff --quiet -- "${VERSION_FILE}"; then
+            echo "::error::${VERSION_FILE} was not modified."
+            exit 1
+          fi
+
+      # Pushes authenticated with GITHUB_TOKEN do not trigger workflows, so this
+      # commit cannot retrigger Ruby CI or this workflow.
+      - name: "Commit And Tag Release"
+        env:
+          BUMP_LEVEL: "${{ steps.version.outputs.level }}"
+          NEXT_VERSION: "${{ steps.version.outputs.next }}"
+          PULL_REQUEST_NUMBER: "${{ github.event.pull_request.number }}"
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${VERSION_FILE}"
+          git commit \
+            --message "Bump version to ${NEXT_VERSION}" \
+            --message "A ${BUMP_LEVEL} release, from merging #${PULL_REQUEST_NUMBER}."
+          git tag --annotate "v${NEXT_VERSION}" \
+            --message "Version ${NEXT_VERSION}"
+
+          git push origin "HEAD:main"
+          git push origin "refs/tags/v${NEXT_VERSION}"
