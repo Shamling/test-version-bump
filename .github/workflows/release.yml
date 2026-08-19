@@ -147,6 +147,9 @@ jobs:
           BUMP_LEVEL: "${{ steps.version.outputs.level }}"
           NEXT_VERSION: "${{ steps.version.outputs.next }}"
           PULL_REQUEST_NUMBER: "${{ github.event.pull_request.number }}"
+          # Read through the environment, never interpolated into the script
+          # below, so a title cannot inject shell.
+          PULL_REQUEST_TITLE: "${{ github.event.pull_request.title }}"
         run: |
           set -euo pipefail
 
@@ -156,9 +159,10 @@ jobs:
           git add "${VERSION_FILE}"
           git commit \
             --message "Bump version to ${NEXT_VERSION}" \
+            --message "${PULL_REQUEST_TITLE}" \
             --message "A ${BUMP_LEVEL} release, from merging #${PULL_REQUEST_NUMBER}."
           git tag --annotate "v${NEXT_VERSION}" \
-            --message "Version ${NEXT_VERSION}"
+            --message "${PULL_REQUEST_TITLE}"
 
           git push origin "HEAD:main"
           git push origin "refs/tags/v${NEXT_VERSION}"
