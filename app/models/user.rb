@@ -11,4 +11,8 @@ class User
   def full_name
     "#{last_name}, #{first_name}"
   end
+
+  def display_name
+    "#{last_name}, #{first_name[0]}.".gsub(/\w+/, &:capitalize)
+  end
 end
